@@ -1327,6 +1327,13 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)
+    # Capture Semantic Router (x-vsr-*) decision headers when the router proxy
+    # is the active provider. No-op for other providers; never raises.
+    try:
+        from agent.vsr_headers import attach_capture_hook
+        attach_capture_hook(client, agent)
+    except Exception:
+        pass
     _ra().logger.info(
         "OpenAI client created (%s, shared=%s) %s",
         reason,

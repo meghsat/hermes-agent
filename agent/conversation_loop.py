@@ -1816,6 +1816,23 @@ def run_conversation(
                         api_duration, _cache_pct,
                     )
 
+                    # Surface Semantic Router decision (x-vsr-* headers) when the
+                    # router proxy handled this call (i.e. /model router).
+                    try:
+                        from agent.vsr_headers import take_last as _vsr_take, format_summary as _vsr_fmt
+                        _vsr = _vsr_take(agent)
+                        if _vsr:
+                            _vsr_line = _vsr_fmt(_vsr)
+                            # Snapshot for the frontend to render AFTER the
+                            # response box closes (printing here would race the
+                            # CLI's live/streamed response box and interleave
+                            # mid-answer). The CLI reads agent._last_vsr_summary;
+                            # gateways can surface it the same way.
+                            agent._last_vsr_summary = _vsr_line
+                            logger.info("%s", _vsr_line)
+                    except Exception:
+                        logger.debug("vsr header surfacing failed", exc_info=True)
+
                     cost_result = estimate_usage_cost(
                         agent.model,
                         canonical_usage,

@@ -12242,6 +12242,17 @@ class HermesCLI:
                     ))
 
 
+            # Semantic Router decision footer (set by the x-vsr-* capture hook
+            # in agent/vsr_headers.py). Printed here — after the response box is
+            # fully rendered — so it can't interleave with the streamed answer.
+            _vsr_summary = getattr(self.agent, "_last_vsr_summary", None) if self.agent else None
+            if _vsr_summary:
+                _cprint(f"{_DIM}{_vsr_summary}{_RST}")
+                try:
+                    self.agent._last_vsr_summary = None
+                except Exception:
+                    pass
+
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
             if self.bell_on_complete:
