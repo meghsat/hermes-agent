@@ -170,7 +170,6 @@ _sudo_password_cache_lock = threading.Lock()
 # own callback exactly like before. Gateway mode resolves approvals via
 # the per-session queue in tools.approval, not through these callbacks,
 # so it's unaffected.
-import threading
 _callback_tls = threading.local()
 
 
@@ -962,6 +961,28 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """
     _task_env_overrides[task_id] = overrides
 
+    # If a live environment already exists for this task, a freshly registered
+    # ``cwd`` override (e.g. the ACP client switching the editor's project root
+    # mid-session via ``session/load`` / ``session/resume``) must take effect on
+    # the cached env too. ``terminal_tool`` resolves the per-command cwd as
+    # ``workdir > env.cwd > config/override cwd`` so that ordinary in-session
+    # ``cd`` state is preserved; without syncing here the override would sit
+    # below the (already-set) ``env.cwd`` and be silently ignored once any
+    # command has run. Pushing it onto the live env keeps ``cd`` tracking intact
+    # while letting an explicit ACP cwd change win, as the client expects.
+    new_cwd = overrides.get("cwd")
+    if isinstance(new_cwd, str) and new_cwd.strip():
+        # The live env is cached under the raw task_id for per-session surfaces
+        # (ACP/gateway/dashboard) and under the collapsed container id for
+        # isolation-keyed rollouts. Try the raw id first, then the container id,
+        # so a CWD-only override (which collapses to "default") still finds and
+        # updates the originating session's env.
+        container_id = _resolve_container_task_id(task_id)
+        with _env_lock:
+            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+        if env is not None and getattr(env, "cwd", None) is not None:
+            env.cwd = new_cwd
+
 
 def clear_task_env_overrides(task_id: str):
     """
@@ -990,9 +1011,20 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     task_id, we honour it by returning the task_id unchanged -- those
     rollouts need their own isolated sandbox, which is the whole point of
     the override.
+
+    CWD-only overrides (registered by the ACP adapter for workspace
+    tracking) are *not* isolation signals — they should not cause each
+    session to spin up its own container.  Only overrides containing
+    backend-specific image keys or ``env_type`` trigger isolation.
     """
+    _ISOLATION_KEYS = frozenset({
+        "docker_image", "modal_image", "singularity_image",
+        "daytona_image", "env_type",
+    })
     if task_id and task_id in _task_env_overrides:
-        return task_id
+        overrides = _task_env_overrides[task_id]
+        if set(overrides.keys()) & _ISOLATION_KEYS:
+            return task_id
     return "default"
 
 
@@ -1014,6 +1046,20 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
         )
 
 
+def _safe_getcwd() -> str:
+    """Return the current working directory, tolerating a deleted CWD.
+
+    ``os.getcwd()`` raises FileNotFoundError when the process's working
+    directory has been removed out from under it (e.g. a scratch workspace
+    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
+    user's home directory, so terminal setup never crashes on a stale CWD.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1026,7 +1072,7 @@ def _get_env_config() -> Dict[str, Any]:
     # remote home, and everything else starts in the backend's default
     # root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
     else:
@@ -1042,7 +1088,7 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
@@ -1718,6 +1764,30 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _resolve_command_cwd(
+    *,
+    workdir: Optional[str],
+    env: Any,
+    default_cwd: str,
+) -> str:
+    """Return the cwd for a command, preferring the live session cwd.
+
+    ``terminal_tool`` historically re-sent the init-time/config cwd on every
+    call. That broke session-local ``cd`` state: the environment tracked the
+    new directory in ``env.cwd``, but foreground/background calls kept forcing
+    the old cwd back through ``env.execute(..., cwd=...)``. Explicit
+    ``workdir=`` must still override everything.
+    """
+    if workdir:
+        return workdir
+
+    live_cwd = getattr(env, "cwd", None)
+    if isinstance(live_cwd, str) and live_cwd.strip():
+        return live_cwd
+
+    return default_cwd
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1783,8 +1853,20 @@ def terminal_tool(
         effective_task_id = _resolve_container_task_id(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
-        # before falling back to global env var config
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        # before falling back to global env var config.
+        #
+        # Overrides are keyed by the *raw* task_id (that's the key
+        # ``register_task_env_overrides`` writes under), NOT by the collapsed
+        # container id. A CWD-only override collapses ``effective_task_id`` to
+        # ``"default"`` for container sharing, but its cwd must still be read
+        # back here under the originating task_id, or the override is silently
+        # dropped. Fall back to the collapsed id so isolation-keyed RL/benchmark
+        # overrides (registered under an id that equals their container id) keep
+        # resolving as before.
+        overrides = (
+            (_task_env_overrides.get(task_id) if task_id else None)
+            or _task_env_overrides.get(effective_task_id, {})
+        )
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
@@ -1833,9 +1915,18 @@ def terminal_tool(
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
         with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                env = _active_environments[effective_task_id]
+            # Prefer the collapsed container id, but fall back to an env cached
+            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
+            # with a CWD-only override collapse to "default" for container
+            # sharing, yet an env may already be cached under the originating
+            # task_id; honor it instead of spawning a duplicate.
+            _existing_key = (
+                effective_task_id if effective_task_id in _active_environments
+                else (task_id if task_id and task_id in _active_environments else None)
+            )
+            if _existing_key is not None:
+                _last_activity[_existing_key] = time.time()
+                env = _active_environments[_existing_key]
                 needs_creation = False
             else:
                 needs_creation = True
@@ -1850,9 +1941,13 @@ def terminal_tool(
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
-                    if effective_task_id in _active_environments:
-                        _last_activity[effective_task_id] = time.time()
-                        env = _active_environments[effective_task_id]
+                    _existing_key = (
+                        effective_task_id if effective_task_id in _active_environments
+                        else (task_id if task_id and task_id in _active_environments else None)
+                    )
+                    if _existing_key is not None:
+                        _last_activity[_existing_key] = time.time()
+                        env = _active_environments[_existing_key]
                         needs_creation = False
 
                 if needs_creation:
@@ -1990,7 +2085,11 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             session_key = get_current_session_key(default="")
-            effective_cwd = workdir or cwd
+            effective_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                env=env,
+                default_cwd=cwd,
+            )
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2207,7 +2306,11 @@ def terminal_tool(
                 try:
                     execute_kwargs = {
                         "timeout": effective_timeout,
-                        "cwd": workdir or cwd,
+                        "cwd": _resolve_command_cwd(
+                            workdir=workdir,
+                            env=env,
+                            default_cwd=cwd,
+                        ),
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
@@ -2468,7 +2571,7 @@ if __name__ == "__main__":
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
-    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
+    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
     print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")

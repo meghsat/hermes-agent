@@ -66,7 +66,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
-from utils import is_truthy_value
+from utils import env_int, is_truthy_value
 from hermes_cli.config import cfg_get
 
 try:
@@ -78,10 +78,12 @@ try:
     from tools.url_safety import (
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
+        normalize_url_for_request as _normalize_url_for_request,
     )
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
+    _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
 # Browser-provider ABC + registry — PR #25214 moved the per-vendor providers
 # (Browserbase / Browser Use / Firecrawl) out of ``tools/browser_providers/``
 # and into ``plugins/browser/<vendor>/``. The dispatcher consults the
@@ -1178,7 +1180,7 @@ _cleanup_done = False
 # Session inactivity timeout (seconds) - cleanup if no activity for this long
 # Default: 5 minutes. Needs headroom for LLM reasoning between browser commands,
 # especially when subagents are doing multi-step browser tasks.
-BROWSER_SESSION_INACTIVITY_TIMEOUT = int(os.environ.get("BROWSER_INACTIVITY_TIMEOUT", "300"))
+BROWSER_SESSION_INACTIVITY_TIMEOUT = env_int("BROWSER_INACTIVITY_TIMEOUT", 300)
 
 # Track last activity time per session
 _session_last_activity: Dict[str, float] = {}
@@ -2310,6 +2312,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "error": "Blocked: URL contains what appears to be an API key or token. "
                      "Secrets must not be sent in URLs.",
         })
+    url = _normalize_url_for_request(url)
+    normalized_decoded = urllib.parse.unquote(url)
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(normalized_decoded):
+        return json.dumps({
+            "success": False,
+            "error": "Blocked: URL contains what appears to be an API key or token. "
+                     "Secrets must not be sent in URLs.",
+        })
 
     # SSRF protection — block private/internal addresses before navigating.
     # Skipped for local backends (Camofox, headless Chromium without a cloud
@@ -2872,6 +2882,22 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
             response = {
                 "success": False,
                 "error": f"JavaScript evaluation is not supported by this browser backend. {err}",
+            }
+            return json.dumps(_copy_fallback_warning(response, result))
+        # A live DOM node / NodeList / Window can't be JSON-serialized by CDP
+        # and fails the eval with "Object reference chain is too long".  The
+        # supervisor fast path retries with returnByValue=false, but the CLI
+        # subprocess can't, so turn the cryptic protocol error into actionable
+        # guidance instead of surfacing it raw.
+        if "reference chain is too long" in err.lower():
+            response = {
+                "success": False,
+                "error": (
+                    "Expression returned a live DOM node / NodeList / Window, "
+                    "which can't be serialized. Extract a primitive value "
+                    "(e.g. .innerText, .href, .src, .value) or use "
+                    "JSON.stringify() / a snapshot tool instead."
+                ),
             }
             return json.dumps(_copy_fallback_warning(response, result))
         response = {

@@ -63,6 +63,44 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
     return False
 
 
+def test_write_stdin_uses_str_for_windows_pty(monkeypatch, registry):
+    """pywinpty expects str input; bytes raises a PyString conversion error."""
+    written = []
+
+    class _FakePty:
+        def write(self, value):
+            written.append(value)
+
+    session = _make_session(sid="pty-win")
+    session._pty = _FakePty()
+    registry._running[session.id] = session
+    monkeypatch.setattr("tools.process_registry._IS_WINDOWS", True)
+
+    result = registry.write_stdin(session.id, "hello\n")
+
+    assert result == {"status": "ok", "bytes_written": 6}
+    assert written == ["hello\n"]
+    assert isinstance(written[0], str)
+
+
+def test_write_stdin_uses_bytes_for_posix_pty(monkeypatch, registry):
+    written = []
+
+    class _FakePty:
+        def write(self, value):
+            written.append(value)
+
+    session = _make_session(sid="pty-posix")
+    session._pty = _FakePty()
+    registry._running[session.id] = session
+    monkeypatch.setattr("tools.process_registry._IS_WINDOWS", False)
+
+    result = registry.write_stdin(session.id, "hello\n")
+
+    assert result == {"status": "ok", "bytes_written": 6}
+    assert written == [b"hello\n"]
+
+
 # =========================================================================
 # Get / Poll
 # =========================================================================
@@ -481,8 +519,8 @@ class TestSpawnEnvSanitization:
             def get_temp_dir(self):
                 return "/data/data/com.termux/files/usr/tmp"
 
-            def execute(self, command, timeout=None):
-                self.commands.append((command, timeout))
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
                 return {"output": "4321\n"}
 
         env = FakeEnv()
@@ -501,6 +539,52 @@ class TestSpawnEnvSanitization:
         assert "cat /tmp/hermes_bg_" not in bg_command
         fake_thread.start.assert_called_once()
 
+    def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "syntax error", "returncode": 2}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "echo hello")
+
+        assert session.exited is True
+        assert session.exit_code == 2
+        assert session.pid is None
+        assert session.output_buffer == "syntax error"
+        fake_thread.start.assert_not_called()
+        # A failed launch must not be exposed as a running/tracked session.
+        assert session.id not in registry._running
+
+    def test_spawn_via_env_disables_rewrite_for_bg_wrapper(self, registry):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_via_env(env, "echo hello")
+
+        args, kwargs = env.commands[0]
+        assert kwargs.get("rewrite_compound_background") is False
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
@@ -514,8 +598,8 @@ class TestSpawnEnvSanitization:
                     {"output": "0\n"},
                 ])
 
-            def execute(self, command, timeout=None):
-                self.commands.append((command, timeout))
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
                 return next(self._responses)
 
         env = FakeEnv()
