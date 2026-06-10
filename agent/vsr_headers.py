@@ -90,6 +90,41 @@ def take_last(agent: Any) -> Optional[Dict[str, str]]:
     return vsr or None
 
 
+def record_router_usage(agent: Any, vsr: Dict[str, str]) -> None:
+    """Use the router's real token count from ``x-vsr-*`` headers.
+
+    The proxy returns ``usage: {0,0,0}``, so Hermes' context bar would otherwise
+    fall back to a tool-schema-inflated estimate. ``x-vsr-context-token-count``
+    is the real input-token count the backend processed (matches lemonade's
+    telemetry), so we (1) feed it into the context compressor to make the live
+    bar accurate, and (2) accumulate per-routed-model totals on the agent for
+    the status-bar breakdown. Never raises.
+    """
+    try:
+        try:
+            ctx = int(vsr.get("context-token-count"))
+        except (TypeError, ValueError):
+            return
+        model = vsr.get("selected-model") or vsr.get("looper-model") or "?"
+
+        # (1) Make the live context bar reflect real tokens, not the estimate.
+        comp = getattr(agent, "context_compressor", None)
+        if comp is not None and ctx > 0:
+            comp.last_prompt_tokens = ctx
+            comp.last_real_prompt_tokens = ctx
+
+        # (2) Per-model cumulative tracker (input tokens + call count).
+        usage = getattr(agent, "_router_model_usage", None)
+        if usage is None:
+            usage = {}
+            agent._router_model_usage = usage
+        entry = usage.setdefault(model, {"input_tokens": 0, "calls": 0})
+        entry["input_tokens"] += ctx
+        entry["calls"] += 1
+    except Exception:
+        pass
+
+
 def format_summary(vsr: Dict[str, str]) -> str:
     """Build a compact one-line summary of a router decision for display."""
     model = vsr.get("selected-model") or vsr.get("looper-model") or "?"

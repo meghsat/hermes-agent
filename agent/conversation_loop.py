@@ -1624,9 +1624,17 @@ def run_conversation(
                     # Surface Semantic Router decision (x-vsr-* headers) when the
                     # router proxy handled this call (i.e. /model router).
                     try:
-                        from agent.vsr_headers import take_last as _vsr_take, format_summary as _vsr_fmt
+                        from agent.vsr_headers import (
+                            take_last as _vsr_take,
+                            format_summary as _vsr_fmt,
+                            record_router_usage as _vsr_record,
+                        )
                         _vsr = _vsr_take(agent)
                         if _vsr:
+                            # Feed the router's real token count into the context
+                            # tracker (proxy usage is 0/0/0) and accumulate
+                            # per-model totals for the status bar.
+                            _vsr_record(agent, _vsr)
                             _vsr_line = _vsr_fmt(_vsr)
                             # Snapshot for the frontend to render AFTER the
                             # response box closes (printing here would race the

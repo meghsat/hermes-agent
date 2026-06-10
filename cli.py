@@ -3848,6 +3848,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # Per-model token tracker (router mode): cumulative input tokens per
+        # routed backend, populated from x-vsr-* headers (see vsr_headers.py).
+        snapshot["router_model_usage"] = dict(getattr(agent, "_router_model_usage", {}) or {})
+
         return snapshot
 
     @staticmethod
@@ -4040,6 +4044,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         cont = " | Continuous" if self._voice_continuous else ""
         return [("class:voice-status", f" 🎤 Voice mode{tts}{cont}  —  {label} to record ")]
 
+    @staticmethod
+    def _format_router_usage_segment(usage: Optional[dict]) -> str:
+        """Compact per-routed-model token breakdown for the status bar.
+
+        e.g. ``kimi-k2p6 8.4K · Qwen3.5-9B-NoT… 198 · Σ 8.6K``. Returns "" when
+        there's no router usage yet (i.e. not in /model router mode).
+        """
+        if not usage:
+            return ""
+
+        def _short(m: str) -> str:
+            s = (m or "?").rsplit("/", 1)[-1]
+            return s if len(s) <= 16 else s[:15] + "…"
+
+        parts = []
+        total_tokens = 0
+        total_calls = 0
+        for _m, _d in usage.items():
+            tok = int((_d or {}).get("input_tokens", 0) or 0)
+            calls = int((_d or {}).get("calls", 0) or 0)
+            total_tokens += tok
+            total_calls += calls
+            # "<model> <tokens>/<calls>" — calls makes the cumulative total
+            # self-explanatory (e.g. one agentic question = many proxy calls).
+            parts.append(f"{_short(_m)} {format_token_count_compact(tok)}/{calls}")
+        if len(usage) > 1:
+            parts.append(f"Σ {format_token_count_compact(total_tokens)}/{total_calls}")
+        return " · ".join(parts)
+
     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
         """Return a compact one-line session status string for the TUI footer."""
         try:
@@ -4089,6 +4122,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             bg_proc_count = snapshot.get("active_background_processes", 0)
             if bg_proc_count:
                 parts.append(f"⚙ {bg_proc_count}")
+            _router_seg = self._format_router_usage_segment(snapshot.get("router_model_usage"))
+            if _router_seg:
+                parts.append(_router_seg)
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -4185,6 +4221,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if bg_proc_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
+                    _router_seg = self._format_router_usage_segment(snapshot.get("router_model_usage"))
+                    if _router_seg:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", _router_seg))
                     frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
